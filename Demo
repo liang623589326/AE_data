@@ -1,0 +1,249 @@
+
+%% AE data processing, SPC-Means clustering, and SVM classification
+clearvars; close all; clc;
+
+%% 1. Parameters
+spcDir = 'E:\**\**\**\SPC';
+outputDir = 'D:\**';
+
+%% 2. Load AE data
+assert(isfile('FLT.txt'), '31-0.45J-3_FLT.txt.');
+
+datasetStruct = importdata('FLT.txt');
+
+if isstruct(datasetStruct)
+    dataset = datasetStruct.data;
+else
+    dataset = datasetStruct;
+end
+
+%% 3. Extract RA and AF
+riseTime = data(:, 3);
+amplitude = data(:, 7);
+averageFrequency = data(:, 8);
+
+% Retain the original every-other-event sampling strategy.
+data = data(1:2:end, :);
+
+riseTime = data(:, 3);
+amplitude = data(:, 7);
+averageFrequency = data(:, 8);
+
+RA = riseTime ./ amplitude;
+AF = averageFrequency;
+
+X = [RA, AF];
+
+% Remove invalid feature rows.
+validFeatures = all(isfinite(X), 2) & ...
+                all(X >= 0, 2);
+
+X = X(validFeatures, :);
+
+
+
+fprintf('最终分析样本数：%d\n', size(X, 1));
+
+%% 6. SPC-Means clustering
+
+addpath(spcDir);
+
+% Standardize features.
+Xscaled = zscore(X);
+
+% Distance matrix.
+dist = distance_matrix(Xscaled);
+
+% SPC-Means clustering.
+idx = spk_means(Xscaled, numClusters, densityRatio, dist);
+idx = idx(:);
+
+
+
+% Retain the original cluster-to-crack interpretation.
+cluster1 = find(idx == 2);  % Tension cracks
+cluster2 = find(idx == 1);  % Shear cracks
+
+ratioTension = 100 * numel(cluster1) / numel(idx);
+ratioShear = 100 * numel(cluster2) / numel(idx);
+
+fprintf('拉伸裂纹聚类占比：%.2f%%\n', ratioTension);
+fprintf('剪切裂纹聚类占比：%.2f%%\n', ratioShear);
+
+%% 7. Prepare SVM labels
+cdata = X;
+
+% Convert cluster 2 to -1 and cluster 1 to +1.
+grp = ones(size(idx));
+grp(idx == 2) = -1;
+
+classCounts = [sum(grp == -1), sum(grp == 1)];
+actualFolds = min(numFolds, min(classCounts));
+
+
+% Stratified cross-validation using actual observations and labels.
+cv = cvpartition(grp, 'KFold', actualFolds);
+
+%% 8. Optimize linear SVM
+opts = struct( ...
+    'CVPartition', cv, ...
+    'AcquisitionFunctionName', 'expected-improvement-plus', ...
+    'MaxObjectiveEvaluations', maxOptimizations, ...
+    'ShowPlots', false, ...
+    'Verbose', 0);
+
+Mdl = fitcsvm(cdata, grp, ...
+    'KernelFunction', 'linear', ...
+    'Standardize', true, ...
+    'OptimizeHyperparameters', 'auto', ...
+    'HyperparameterOptimizationOptions', opts);
+
+disp(Mdl.HyperparameterOptimizationResults.XAtMinEstimatedObjective);
+
+[bestPointResult, criterionValue, iteration] = ...
+    bestPoint(Mdl.HyperparameterOptimizationResults);
+
+disp(bestPointResult);
+
+fprintf('Best estimated objective: %.6f\n', criterionValue);
+fprintf('Selected iteration: %d\n', iteration);
+
+%% 9. Calculate decision boundary scores
+x1Grid = linspace(min(cdata(:,1)), max(cdata(:,1)), ...
+    max(2, ceil(range(cdata(:,1)) / gridStep) + 1));
+
+x2Grid = linspace(min(cdata(:,2)), max(cdata(:,2)), ...
+    max(2, ceil(range(cdata(:,2)) / gridStep) + 1));
+
+[X1Grid, X2Grid] = meshgrid(x1Grid, x2Grid);
+xGrid = [X1Grid(:), X2Grid(:)];
+
+[~, scores] = predict(Mdl, xGrid);
+
+% Explicitly identify the positive and negative score columns.
+positiveCol = find(Mdl.ClassNames == 1, 1);
+negativeCol = find(Mdl.ClassNames == -1, 1);
+
+
+% Plot the zero crossing of the difference in class scores.
+decisionScore = scores(:, positiveCol) - scores(:, negativeCol);
+decisionGrid = reshape(decisionScore, size(X1Grid));
+
+%% 10. Figure 1: SPC-Means clustering
+figure(1); clf;
+
+scatter(X(cluster1,1), X(cluster1,2), 50, 'o', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.3010 0.7450 0.9330]);
+hold on;
+
+scatter(X(cluster2,1), X(cluster2,2), 50, 'v', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.8500 0.3250 0.0980]);
+
+formatAxes();
+
+xlabel('\fontname{Times New Roman}RA/ms/V', 'FontSize', 20);
+ylabel('\fontname{Times New Roman}AF/kHz', 'FontSize', 20);
+
+legend({'Tension', 'Shear'}, ...
+    'FontSize', 18, ...
+    'Location', 'northeast', 'Box', 'off');
+
+axis square;
+
+exportgraphics(gca, fullfile(outputDir, 'kmeans1.jpg'), ...
+    'Resolution', 300);
+
+%% 11. Figure 2: SVM support vectors and decision boundary
+figure(2); clf;
+
+scatter(X(cluster1,1), X(cluster1,2), 50, 'o', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.3010 0.7450 0.9330]);
+hold on;
+
+scatter(X(cluster2,1), X(cluster2,2), 50, 'v', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.8500 0.3250 0.0980]);
+
+sv = Mdl.IsSupportVector;
+
+plot(cdata(sv,1), cdata(sv,2), 'p', ...
+    'MarkerSize', 10, ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.4660 0.6740 0.1880]);
+
+contour(X1Grid, X2Grid, decisionGrid, [0 0], ...
+    'k--', 'LineWidth', 2);
+
+formatAxes();
+
+xlabel('\fontname{Times New Roman}RA/ms/V', 'FontSize', 20);
+ylabel('\fontname{Times New Roman}AF/kHz', 'FontSize', 20);
+
+legend({'Tension', 'Shear', 'SVM', 'Line'}, ...
+    'Location', 'northeast', 'Box', 'off');
+
+axis square;
+
+exportgraphics(gca, fullfile(outputDir, 'kmeans_classify1.jpg'), ...
+    'Resolution', 300);
+
+%% 12. Figure 3: Comparison with reference lines
+figure(3); clf;
+
+scatter(X(cluster2,1), X(cluster2,2), 50, 'o', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.3010 0.7450 0.9330]);
+hold on;
+
+scatter(X(cluster1,1), X(cluster1,2), 50, 'v', 'filled', ...
+    'MarkerEdgeColor', [0 0 0], ...
+    'MarkerFaceColor', [0.8500 0.3250 0.0980]);
+
+contour(X1Grid, X2Grid, decisionGrid, [0 0], ...
+    'k-', 'LineWidth', 2);
+
+% Original reference lines retained.
+plot([0 1.75], [0 250], 'r-', 'LineWidth', 1.5, ...
+    'HandleVisibility', 'off');
+plot([0 3.5], [0 280], 'm--', 'LineWidth', 1.5, ...
+    'HandleVisibility', 'off');
+plot([0 6], [0 150], 'b:', 'LineWidth', 1.5, ...
+    'HandleVisibility', 'off');
+plot([0 6], [0 24], 'c-.', 'LineWidth', 1.5, ...
+    'HandleVisibility', 'off');
+plot([0 6], [0 6], 'g-', 'LineWidth', 3, ...
+    'HandleVisibility', 'off');
+plot([0 6], [0 2.4], 'r--', 'LineWidth', 3, ...
+    'HandleVisibility', 'off');
+plot([0 6], [0 0.9], 'm:', 'LineWidth', 3, ...
+    'HandleVisibility', 'off');
+
+formatAxes();
+
+xlabel('\fontname{Times New Roman}\fontsize{20}RA (ms/V)');
+ylabel('\fontname{Times New Roman}\fontsize{20}AF (kHz)');
+
+legend({'Tension', 'Shear', 'SPC-SVM'}, ...
+    'Location', 'northeast', 'Box', 'off');
+
+axis square;
+
+exportgraphics(gca, fullfile(outputDir, 'kmeans-RA-AF1.jpg'), ...
+    'Resolution', 300);
+
+%% 13. Local plotting function
+function formatAxes()
+    set(gca, ...
+        'XLim', [0 10], ...
+        'XTick', 0:2:10, ...
+        'YLim', [0 300], ...
+        'YTick', 0:50:300, ...
+        'FontName', 'Times New Roman', ...
+        'FontSize', 20, ...
+        'LineWidth', 2, ...
+        'YColor', 'k');
+    box on;
+end
